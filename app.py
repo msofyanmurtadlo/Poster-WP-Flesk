@@ -1,143 +1,103 @@
-import requests
 from flask import Flask, render_template, request, jsonify
+import asyncio
+import aiohttp
+import base64
 
 app = Flask(__name__)
 
-# Fungsi untuk membuat postingan di beberapa domain
-def create_posts_for_domains(domains, post_title, post_content, categories, tags):
-    domain_results = {}
-
-    for domain_data in domains:
-        parts = domain_data.split(":")
-        if len(parts) != 3:
-            domain_results[domain_data] = "Format tidak valid"
-            continue
-
-        domain, username, password = parts
-        cat_ids = get_category_ids(domain, username, password, categories)
-        tag_ids = get_tag_ids(domain, username, password, tags)
-
-        post_data = {
-            'title': post_title,
-            'content': post_content.replace('@Domain', domain).replace('@Judul', post_title),
-            'status': 'draft',
-            'categories': cat_ids,
-            'tags': tag_ids
-        }
-
-        response = requests.post(
-            f'https://{domain}/wp-json/wp/v2/posts',
-            auth=(username, password),
-            json=post_data
-        )
-
-        if response.status_code == 201:
-            domain_results[domain] = True
-        else:
-            domain_results[domain] = f"HTTP {response.status_code}"
-
-    return domain_results
-
-# Fungsi untuk mendapatkan ID kategori
-def get_category_ids(domain, username, password, categories):
-    ids = []
-    for name in categories:
-        response = requests.get(
-            f'https://{domain}/wp-json/wp/v2/categories',
-            params={'search': name},
-            auth=(username, password)
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            if data and 'id' in data[0]:
-                ids.append(data[0]['id'])
+async def post_to_wordpress(session, domain, username, password, post_data):
+    auth = base64.b64encode(f'{username}:{password}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {auth}',
+        'Content-Type': 'application/json'
+    }
+    url = f'https://{domain}/wp-json/wp/v2/posts'
+    
+    try:
+        async with session.post(url, headers=headers, json=post_data) as response:
+            if response.status == 201:
+                return f'Successfully posted to {domain}'
             else:
-                created = create_category(domain, username, password, name)
-                if created:
-                    ids.append(created)
+                response_text = await response.text()
+                return f'Failed to post to {domain}: HTTP {response.status} - {response_text}'
+    except Exception as e:
+        return f'Error posting to {domain}: {str(e)}'
+
+async def get_category_ids(session, domain, username, password, categories):
+    ids = []
+    for category in categories:
+        url = f"https://{domain}/wp-json/wp/v2/categories?search={category}"
+        auth = base64.b64encode(f'{username}:{password}'.encode()).decode()
+        headers = {'Authorization': f'Basic {auth}'}
+        
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data:
+                        ids.append(data[0]['id'])
+                    else:
+                        created_id = await create_category(session, domain, username, password, category)
+                        ids.append(created_id)
+        except Exception as e:
+            print(f"Error fetching category '{category}' on {domain}: {str(e)}")
     return ids
 
-# Fungsi untuk mendapatkan ID tag
-def get_tag_ids(domain, username, password, tags):
+async def get_tag_ids(session, domain, username, password, tags):
     ids = []
-    for name in tags:
-        response = requests.get(
-            f'https://{domain}/wp-json/wp/v2/tags',
-            params={'search': name},
-            auth=(username, password)
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            if data and 'id' in data[0]:
-                ids.append(data[0]['id'])
-            else:
-                created = create_tag(domain, username, password, name)
-                if created:
-                    ids.append(created)
+    for tag in tags:
+        url = f"https://{domain}/wp-json/wp/v2/tags?search={tag}"
+        auth = base64.b64encode(f'{username}:{password}'.encode()).decode()
+        headers = {'Authorization': f'Basic {auth}'}
+        
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data:
+                        ids.append(data[0]['id'])
+                    else:
+                        created_id = await create_tag(session, domain, username, password, tag)
+                        ids.append(created_id)
+        except Exception as e:
+            print(f"Error fetching tag '{tag}' on {domain}: {str(e)}")
     return ids
 
-# Fungsi untuk membuat kategori jika tidak ada
-def create_category(domain, username, password, name):
-    response = requests.post(
-        f'https://{domain}/wp-json/wp/v2/categories',
-        auth=(username, password),
-        json={'name': name}
-    )
-    if response.status_code == 201:
-        return response.json().get('id')
-    return None
+async def post_to_multiple_domains(domains, post_title, post_content, categories, tags):
+    post_data = {
+        'title': post_title,
+        'content': post_content,
+        'status': 'draft',
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for domain, username, password in domains:
+            cat_ids = await get_category_ids(session, domain, username, password, categories)
+            tag_ids = await get_tag_ids(session, domain, username, password, tags)
+            post_data['categories'] = cat_ids
+            post_data['tags'] = tag_ids
+            task = post_to_wordpress(session, domain, username, password, post_data)
+            tasks.append(task)
+        
+        return await asyncio.gather(*tasks)
 
-# Fungsi untuk membuat tag jika tidak ada
-def create_tag(domain, username, password, name):
-    response = requests.post(
-        f'https://{domain}/wp-json/wp/v2/tags',
-        auth=(username, password),
-        json={'name': name}
-    )
-    if response.status_code == 201:
-        return response.json().get('id')
-    return None
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/submit', methods=['POST'])
+@app.route('/submit_post', methods=['POST'])
 def submit_post():
     post_title = request.form['postTitle']
     post_content = request.form['postContent']
     domain_input = request.form['domain']
-    categories = request.form['categories']
-    tags = request.form['tags']
-
-    if not post_title or not post_content:
-        return jsonify({'message': 'Judul dan konten harus diisi.'})
-    elif not domain_input:
-        return jsonify({'message': 'Harap masukkan domain.'})
-    else:
-        domains = [d.strip() for d in domain_input.split('\n') if d.strip()]
-        categories = [c.strip() for c in categories.split(',') if c.strip()]
-        tags = [t.strip() for t in tags.split(',') if t.strip()]
-
-        if not categories:
-            return jsonify({'message': 'Kategori tidak boleh kosong.'})
-        elif not tags:
-            return jsonify({'message': 'Tag tidak boleh kosong.'})
-        else:
-            domain_results = create_posts_for_domains(domains, post_title, post_content, categories, tags)
-
-            success_domains = [domain for domain, result in domain_results.items() if result is True]
-            failed_domains = [f"{domain} ({result})" for domain, result in domain_results.items() if result is not True]
-
-            response_message = ''
-            if success_domains:
-                response_message += '\n'.join([f"{domain} berhasil" for domain in success_domains]) + '\n'
-            if failed_domains:
-                response_message += '\n'.join([f"{domain} gagal" for domain in failed_domains]) + '\n'
-
-            return jsonify({'message': response_message})
+    categories = request.form['categories'].split(',')
+    tags = request.form['tags'].split(',')
+    
+    domains = [tuple(domain.strip().split(':')) for domain in domain_input.splitlines()]
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    tasks = loop.run_until_complete(post_to_multiple_domains(domains, post_title, post_content, categories, tags))
+    
+    # Mengembalikan log sebagai response JSON
+    return jsonify({'log': '\n'.join(tasks)})
 
 if __name__ == '__main__':
     app.run(debug=True)
